@@ -12,3 +12,4 @@ from .gemnet.gemnet import GemNetT
 from .painn.painn import PaiNN
 from .schnet import SchNetWrap as SchNet
 from .spinconv import spinconv
+from .comenet.comenet import ComENet
