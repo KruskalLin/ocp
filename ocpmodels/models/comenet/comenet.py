@@ -6,7 +6,7 @@ ComENet: Towards Complete and Efficient Message Passing for 3D Molecular Graphs:
 """
 
 from torch_cluster import radius_graph
-from torch_geometric.nn import MessagePassing, LayerNorm
+from torch_geometric.nn import MessagePassing, GraphNorm
 from torch_geometric.nn.acts import swish
 from torch_geometric.nn import inits
 
@@ -31,8 +31,6 @@ try:
     import sympy as sym
 except ImportError:
     sym = None
-
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 class Linear(torch.nn.Module):
@@ -179,7 +177,7 @@ class EdgeGraphConv(MessagePassing):
         return matmul(adj_t, x[0], reduce=self.aggr)
 
 
-class SimpleInteractionBlock(torch.nn.Module):
+class InteractionBlock(torch.nn.Module):
     """
         Atom interaction block.
 
@@ -202,7 +200,7 @@ class SimpleInteractionBlock(torch.nn.Module):
             output_channels,
             act=swish,
     ):
-        super(SimpleInteractionBlock, self).__init__()
+        super(InteractionBlock, self).__init__()
         self.act = act
 
         self.conv1 = EdgeGraphConv(hidden_channels, hidden_channels)
@@ -215,7 +213,7 @@ class SimpleInteractionBlock(torch.nn.Module):
 
         self.lin_cat = Linear(2 * hidden_channels, hidden_channels)
 
-        self.norm = LayerNorm(hidden_channels)
+        self.norm = GraphNorm(hidden_channels)
 
         # Transformations of Bessel and spherical basis representations.
         self.lin_feature1 = NonLinear(num_radial * num_spherical ** 2, hidden_channels, hidden_channels)
@@ -312,7 +310,7 @@ class ComENet(nn.Module):
 
         self.interaction_blocks = torch.nn.ModuleList(
             [
-                SimpleInteractionBlock(
+                InteractionBlock(
                     hidden_channels,
                     num_radial,
                     num_spherical,
@@ -367,7 +365,7 @@ class ComENet(nn.Module):
             dist = out["distances"]
             vecs = out["distance_vec"]
         else:
-            edge_index = radius_graph(data.pos, r=self.cutoff, batch=batch, max_num_neighbors=50)
+            edge_index = radius_graph(data.pos, r=self.cutoff, batch=batch)
             j, i = edge_index
             vecs = data.pos[j] - data.pos[i]
             dist = vecs.norm(dim=-1)
@@ -375,87 +373,81 @@ class ComENet(nn.Module):
         # Embedding block.
         x = self.emb(z)
 
-        # Calculate distances.
-        _, argmin0 = scatter_min(dist, i, dim_size=num_nodes)
-        argmin0[argmin0 >= len(i)] = 0
-        n0 = j[argmin0]
-        add = torch.zeros_like(dist).to(dist.device)
-        add[argmin0] = self.cutoff
+        # Get reference nodes.
+        # --------------------------------------------------------
+        # Nearest neighbor f_i and second nearest neighbor s_i for i
+
+        _, argmin0_i = scatter_min(dist, i, dim_size=num_nodes)
+        argmin0_i[argmin0_i >= len(i)] = 0
+        f_i = j[argmin0_i][i]
+
+        add = torch.zeros_like(dist)
+        add[argmin0_i] = self.cutoff
         dist1 = dist + add
 
-        _, argmin1 = scatter_min(dist1, i, dim_size=num_nodes)
-        argmin1[argmin1 >= len(i)] = 0
-        n1 = j[argmin1]
+        _, argmin1_i = scatter_min(dist1, i, dim_size=num_nodes)
+        argmin1_i[argmin1_i >= len(i)] = 0
+        s_i = j[argmin1_i][i]
+
         # --------------------------------------------------------
+        # Nearest neighbor f_j and second nearest neighbor s_j for j
 
         _, argmin0_j = scatter_min(dist, j, dim_size=num_nodes)
         argmin0_j[argmin0_j >= len(j)] = 0
-        n0_j = i[argmin0_j]
+        f_j = i[argmin0_j][j]
 
-        add_j = torch.zeros_like(dist).to(dist.device)
+        add_j = torch.zeros_like(dist)
         add_j[argmin0_j] = self.cutoff
         dist1_j = dist + add_j
 
-        # i[argmin] = range(0, num_nodes)
         _, argmin1_j = scatter_min(dist1_j, j, dim_size=num_nodes)
         argmin1_j[argmin1_j >= len(j)] = 0
-        n1_j = i[argmin1_j]
+        s_j = i[argmin1_j][j]
 
         # ----------------------------------------------------------
-
-        # n0, n1 for i
-        n0 = n0[i]
-        n1 = n1[i]
-
-        # n0, n1 for j
-        n0_j = n0_j[j]
-        n1_j = n1_j[j]
-
+        # Reference nodes to compute the angle tau
         # tau: (iref, i, j, jref)
-        # when compute tau, do not use n0, n0_j as ref for i and j,
-        # because if n0 = j, or n0_j = i, the computed tau is zero
-        # so if n0 = j, we choose iref = n1
-        # if n0_j = i, we choose jref = n1_j
-        mask_iref = n0 == j
-        iref = torch.clone(n0)
-        iref[mask_iref] = n1[mask_iref]
-        idx_iref = argmin0[i]
-        idx_iref[mask_iref] = argmin1[i][mask_iref]
+        # if f_i = j, we choose iref = s_i, otherwise, iref = f_i
+        # if f_j = i, we choose jref = s_j, otherwise, jref = s_j
+        mask_iref = f_i == j
+        iref = torch.clone(f_i)
+        iref[mask_iref] = s_i[mask_iref]
+        idx_iref = argmin0_i[i]
+        idx_iref[mask_iref] = argmin1_i[i][mask_iref]
 
-        mask_jref = n0_j == i
-        jref = torch.clone(n0_j)
-        jref[mask_jref] = n1_j[mask_jref]
+        mask_jref = f_j == i
+        jref = torch.clone(f_j)
+        jref[mask_jref] = s_j[mask_jref]
         idx_jref = argmin0_j[j]
         idx_jref[mask_jref] = argmin1_j[j][mask_jref]
 
-        pos_ji, pos_in0, pos_in1, pos_iref, pos_jref_j = (
+        pos_i_j, pos_i_fi, pos_i_si, pos_i_iref, pos_jref_j = (
             vecs,
-            vecs[argmin0][i],
-            vecs[argmin1][i],
+            vecs[argmin0_i][i],
+            vecs[argmin1_i][i],
             vecs[idx_iref],
             vecs[idx_jref]
         )
 
-        # Calculate angles.
-        a = ((-pos_ji) * pos_in0).sum(dim=-1)
-        b = torch.cross(-pos_ji, pos_in0).norm(dim=-1)
+        # Calculate angle theta with nodes f_i, i, and j.
+        a = ((pos_i_j) * pos_i_fi).sum(dim=-1)
+        b = torch.cross(pos_i_j, pos_i_fi).norm(dim=-1)
         theta = torch.atan2(b, a)
         theta[theta < 0] = theta[theta < 0] + math.pi
 
-        # Calculate torsions.
-        dist_ji = pos_ji.pow(2).sum(dim=-1).sqrt()
-        plane1 = torch.cross(-pos_ji, pos_in0)
-        plane2 = torch.cross(-pos_ji, pos_in1)
-        a = (plane1 * plane2).sum(dim=-1)  # cos_angle * |plane1| * |plane2|
-        b = (torch.cross(plane1, plane2) * pos_ji).sum(dim=-1) / dist_ji
+        # Calculate angle phi with nodes f_i, s_i, i, and j.
+        plane1 = torch.cross(pos_i_si, pos_i_fi)
+        plane2 = torch.cross(pos_i_j, pos_i_fi)
+        a = (plane1 * plane2).sum(dim=-1)
+        b = torch.cross(plane1, plane2).norm(dim=-1)
         phi = torch.atan2(b, a)
         phi[phi < 0] = phi[phi < 0] + math.pi
 
-        # Calculate right torsions.
-        plane1 = torch.cross(pos_ji, pos_jref_j)
-        plane2 = torch.cross(pos_ji, pos_iref)
-        a = (plane1 * plane2).sum(dim=-1)  # cos_angle * |plane1| * |plane2|
-        b = (torch.cross(plane1, plane2) * pos_ji).sum(dim=-1) / dist_ji
+        # Calculate angle tau with nodes iref, i, j, and jref.
+        plane1 = torch.cross(-pos_i_j, pos_i_iref)
+        plane2 = torch.cross(pos_i_j, pos_jref_j)
+        a = (plane1 * plane2).sum(dim=-1)
+        b = torch.cross(plane1, plane2).norm(dim=-1)
         tau = torch.atan2(b, a)
         tau[tau < 0] = tau[tau < 0] + math.pi
 
